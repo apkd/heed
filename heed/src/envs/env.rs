@@ -243,6 +243,44 @@ impl<T> Env<T> {
         Ok(size)
     }
 
+    /// The size of a compact copy of the current snapshot, including its metadata pages.
+    ///
+    /// Counts free pages rather than summing named database statistics, which omit
+    /// duplicate-value subtrees. This reads the free list without visiting live records.
+    /// Concurrent commits after the snapshot is captured can change the size of a later copy.
+    pub fn compacted_size(&self) -> Result<u64> {
+        let (info, txn) = loop {
+            let info = self.info();
+            let txn = self.read_txn()?;
+            if info.last_txn_id == txn.id() {
+                break (info, txn);
+            }
+        };
+        // LMDB reserves database 0 for the free list. Each value starts with the
+        // native-sized count of page IDs that follow it, as in mdb_env_copyfd1.
+        let mut stat = mem::MaybeUninit::uninit();
+        unsafe { mdb_result(ffi::mdb_stat(txn.txn_ptr().as_mut(), 0, stat.as_mut_ptr()))? };
+        let stat = unsafe { stat.assume_init() };
+        let mut free = stat.ms_branch_pages + stat.ms_leaf_pages + stat.ms_overflow_pages;
+        let mut cursor = RoCursor::new(&txn, 0)?;
+        while let Some((_, value)) = cursor.move_on_next(MoveOperation::NoDup)? {
+            let count = value
+                .get(..mem::size_of::<usize>())
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(usize::from_ne_bytes)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Invalid free page count")
+                })?;
+            free = free.checked_add(count).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Free page count overflow")
+            })?;
+        }
+        let pages = (info.last_page_number + 1)
+            .checked_sub(free)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid free page total"))?;
+        Ok(pages as u64 * u64::from(stat.ms_psize))
+    }
+
     /// Options and flags which can be used to configure how a [`Database`] is opened.
     pub fn database_options(&self) -> DatabaseOpenOptions<'_, '_, T, Unspecified, Unspecified> {
         DatabaseOpenOptions::new(self)
@@ -760,6 +798,43 @@ mod tests {
 
     use crate::types::*;
     use crate::{env_closing_event, EnvOpenOptions, Error};
+
+    #[test]
+    fn compacted_size_includes_duplicate_trees_and_excludes_free_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = unsafe {
+            EnvOpenOptions::new().map_size(32 * 1024 * 1024).max_dbs(1).open(dir.path()).unwrap()
+        };
+        for phase in 0..3 {
+            if phase > 0 {
+                let mut txn = env.write_txn().unwrap();
+                let db = env
+                    .database_options()
+                    .types::<Str, Str>()
+                    .name("duplicates")
+                    .flags(crate::DatabaseFlags::DUP_SORT)
+                    .create(&mut txn)
+                    .unwrap();
+                if phase == 1 {
+                    for i in 0..20_000 {
+                        db.put(&mut txn, "shared", &format!("{i:08}{}", "x".repeat(100))).unwrap();
+                    }
+                } else {
+                    db.delete(&mut txn, "shared").unwrap();
+                }
+                txn.commit().unwrap();
+            }
+            let expected = env.compacted_size().unwrap();
+            let copy = tempfile::tempdir().unwrap();
+            let file = env
+                .copy_to_path(copy.path().join("data.mdb"), crate::CompactionOption::Enabled)
+                .unwrap();
+            assert_eq!(expected, file.metadata().unwrap().len());
+            if phase == 1 {
+                assert!(expected > env.non_free_pages_size().unwrap() * 2);
+            }
+        }
+    }
 
     #[test]
     fn close_env() {
